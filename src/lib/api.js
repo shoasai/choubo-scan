@@ -51,8 +51,11 @@ function authFailed() {
   window.dispatchEvent(new Event("auth-failed"));
 }
 
-// PoC 版と同一シグネチャ: content は Anthropic Messages 形式のブロック配列
-export async function callClaudeFull(content, maxTokens = 2000) {
+const MODEL_LABELS = { claude: "Claude Sonnet", "claude-opus": "Claude Opus", gemini: "Gemini" };
+// 選択モデルが失敗したときの自動エスカレーション先
+const FALLBACK = { claude: "gemini", gemini: "claude", "claude-opus": "claude" };
+
+async function callOnce(model, content, maxTokens) {
   let r;
   try {
     r = await fetch("/api/extract", {
@@ -61,14 +64,16 @@ export async function callClaudeFull(content, maxTokens = 2000) {
         "Content-Type": "application/json",
         "x-app-password": getPassword(),
       },
-      body: JSON.stringify({ model: currentModel, content, max_tokens: maxTokens }),
+      body: JSON.stringify({ model, content, max_tokens: maxTokens }),
     });
   } catch {
     throw new Error("通信エラー (ネットワークを確認してください)");
   }
   if (r.status === 401) {
     authFailed();
-    throw new Error("認証エラー: パスワードを再入力してください");
+    const e = new Error("認証エラー: パスワードを再入力してください");
+    e.noFallback = true;
+    throw e;
   }
   const data = await r.json().catch(() => ({}));
   if (!r.ok || data.error) throw new Error(`API: ${data.error || "HTTP " + r.status}`);
@@ -76,11 +81,36 @@ export async function callClaudeFull(content, maxTokens = 2000) {
   if (data.usage) {
     window.dispatchEvent(
       new CustomEvent("api-usage", {
-        detail: { model: currentModel, in: data.usage.input || 0, out: data.usage.output || 0 },
+        detail: { model, in: data.usage.input || 0, out: data.usage.output || 0 },
       })
     );
   }
   return { text: data.text, stopReason: data.stopReason };
+}
+
+// PoC 版と同一シグネチャ: content は Anthropic Messages 形式のブロック配列。
+// 選択モデルがAPIエラーの場合、別プロバイダへ1回だけ自動フォールバックする。
+export async function callClaudeFull(content, maxTokens = 2000) {
+  const primary = currentModel;
+  try {
+    return await callOnce(primary, content, maxTokens);
+  } catch (e) {
+    const fb = FALLBACK[primary];
+    if (e.noFallback || !fb) throw e;
+    let result;
+    try {
+      result = await callOnce(fb, content, maxTokens);
+    } catch (e2) {
+      if (e2.noFallback) throw e2;
+      throw new Error(`${MODEL_LABELS[primary]}: ${e.message} / 代替の${MODEL_LABELS[fb]}も失敗: ${e2.message}`);
+    }
+    window.dispatchEvent(
+      new CustomEvent("api-note", {
+        detail: { message: `${MODEL_LABELS[primary]}が失敗したため${MODEL_LABELS[fb]}で実行しました (${e.message})` },
+      })
+    );
+    return result;
+  }
 }
 
 export async function callClaude(content, maxTokens = 2000) {

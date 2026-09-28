@@ -509,6 +509,11 @@ export default function ReceiptScanPoc() {
   }, []);
   const [slackSending, setSlackSending] = useState(false);
   const [showOnlyReview, setShowOnlyReview] = useState(false);
+  useEffect(() => {
+    const h = (e) => e.detail?.message && showToast(`ℹ ${e.detail.message}`);
+    window.addEventListener("api-note", h);
+    return () => window.removeEventListener("api-note", h);
+  }, []);
 
   // ---------- 永続データ ----------
   useEffect(() => {
@@ -911,10 +916,14 @@ ${correctionReason.trim() || "(コメントなし)"}
 
   const acceptTypes = mode === "excel" ? ".xlsx,.xls,.csv" : "image/*,application/pdf";
 
-  // 概算コスト (単価は要確認: Sonnet $3/$15 per M, Gemini Flash $0.30/$2.50 per M, 1USD=150円想定)
-  const estYen = aiModel === "claude"
-    ? ((usage.inTok * 3 + usage.outTok * 15) / 1e6) * 150
-    : ((usage.inTok * 0.3 + usage.outTok * 2.5) / 1e6) * 150;
+  // 概算コスト (単価は要確認: Sonnet $3/$15 per M, Gemini 2.5世代 $0.30/$2.50 per M, 1USD=150円想定。
+  // Opus と gemini-3.8 の単価は未確認のため概算を出さない)
+  const estYen =
+    aiModel === "claude"
+      ? ((usage.inTok * 3 + usage.outTok * 15) / 1e6) * 150
+      : aiModel === "gemini"
+      ? ((usage.inTok * 0.3 + usage.outTok * 2.5) / 1e6) * 150
+      : null;
 
   if (!authed) return <LoginGate onSuccess={() => setAuthed(true)} />;
 
@@ -933,13 +942,14 @@ ${correctionReason.trim() || "(コメントなし)"}
               title="読み取りに使うAIモデル"
               className="rounded border border-slate-300 bg-white px-2 py-1 text-[11px] text-slate-600 focus:border-slate-500 focus:outline-none"
             >
-              <option value="claude">Claude Sonnet</option>
-              <option value="gemini">Gemini Flash</option>
+              <option value="claude">Claude Sonnet (標準)</option>
+              <option value="claude-opus">Claude Opus (高精度)</option>
+              <option value="gemini">Gemini Flash (低コスト)</option>
             </select>
             <button onClick={() => setShowLessons(!showLessons)} className="rounded border border-slate-300 px-2 py-1 text-[11px] text-slate-600 transition hover:border-slate-500">
               🧠 教訓 ({lessons.length})
             </button>
-            <span className="rounded border border-slate-300 px-2 py-0.5 text-[10px] tracking-widest text-slate-500">web v1.0</span>
+            <span className="rounded border border-slate-300 px-2 py-0.5 text-[10px] tracking-widest text-slate-500">web v1.2</span>
           </div>
         </div>
       </header>
@@ -1332,7 +1342,8 @@ ${correctionReason.trim() || "(コメントなし)"}
             </p>
             <p className="mt-1 text-[11px] text-slate-400">
               今セッションのAPI使用: 入力 {usage.inTok.toLocaleString()} / 出力 {usage.outTok.toLocaleString()} tokens
-              {usage.inTok > 0 && <> ・概算 約{estYen < 1 ? estYen.toFixed(2) : Math.round(estYen).toLocaleString()}円 (単価は要確認)</>}
+              {usage.inTok > 0 && estYen !== null && <> ・概算 約{estYen < 1 ? estYen.toFixed(2) : Math.round(estYen).toLocaleString()}円 (単価は要確認)</>}
+              {usage.inTok > 0 && estYen === null && <> ・(このモデルの単価は未確認のため概算なし)</>}
             </p>
           </div>
         </section>

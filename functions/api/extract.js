@@ -19,7 +19,7 @@ export async function onRequestPost({ request, env }) {
   try {
     if (model === "gemini") {
       if (!env.GEMINI_API_KEY) return json({ error: "サーバーに GEMINI_API_KEY が未設定です" }, 501);
-      const m = env.GEMINI_MODEL || "gemini-2.5-flash";
+      const m = env.GEMINI_MODEL || "gemini-3.8-flash";
       const r = await fetch(
         `https://generativelanguage.googleapis.com/v1beta/models/${m}:generateContent`,
         {
@@ -56,7 +56,10 @@ export async function onRequestPost({ request, env }) {
         ...(env.ANTHROPIC_WORKSPACE_ID ? { "anthropic-workspace-id": env.ANTHROPIC_WORKSPACE_ID } : {}),
       },
       body: JSON.stringify({
-        model: env.CLAUDE_MODEL || "claude-sonnet-4-6",
+        model:
+          model === "claude-opus"
+            ? env.CLAUDE_OPUS_MODEL || "claude-opus-5-5"
+            : env.CLAUDE_MODEL || "claude-sonnet-4-6",
         max_tokens,
         messages: [{ role: "user", content }],
       }),
