@@ -489,7 +489,11 @@ export default function ReceiptScanPoc() {
 
   // ---- ウェブ版追加: AIモデル選択 / 認証 / API使用量 / Slack ----
   const [aiModel, setAiModel] = useState(() => {
-    try { return localStorage.getItem("choubo:ai-model") || "claude"; } catch { return "claude"; }
+    try {
+      const v = localStorage.getItem("choubo:ai-model");
+      // Sonnet は選択肢から外した (自動フォールバック先としては残る)
+      return v === "claude" || !v ? "gemini" : v;
+    } catch { return "gemini"; }
   });
   useEffect(() => {
     setCurrentModel(aiModel);
@@ -501,9 +505,19 @@ export default function ReceiptScanPoc() {
     window.addEventListener("auth-failed", h);
     return () => window.removeEventListener("auth-failed", h);
   }, []);
-  const [usage, setUsage] = useState({ inTok: 0, outTok: 0 });
+  const [usage, setUsage] = useState({}); // モデル別 { model: {inTok, outTok, calls} }
   useEffect(() => {
-    const h = (e) => setUsage((u) => ({ inTok: u.inTok + (e.detail?.in || 0), outTok: u.outTok + (e.detail?.out || 0) }));
+    const h = (e) => {
+      const m = e.detail?.model || "other";
+      setUsage((u) => ({
+        ...u,
+        [m]: {
+          inTok: (u[m]?.inTok || 0) + (e.detail?.in || 0),
+          outTok: (u[m]?.outTok || 0) + (e.detail?.out || 0),
+          calls: (u[m]?.calls || 0) + 1,
+        },
+      }));
+    };
     window.addEventListener("api-usage", h);
     return () => window.removeEventListener("api-usage", h);
   }, []);
@@ -916,14 +930,7 @@ ${correctionReason.trim() || "(コメントなし)"}
 
   const acceptTypes = mode === "excel" ? ".xlsx,.xls,.csv" : "image/*,application/pdf";
 
-  // 概算コスト (単価は要確認: Sonnet $3/$15 per M, Gemini 2.5世代 $0.30/$2.50 per M, 1USD=150円想定。
-  // Opus と gemini-3.8 の単価は未確認のため概算を出さない)
-  const estYen =
-    aiModel === "claude"
-      ? ((usage.inTok * 3 + usage.outTok * 15) / 1e6) * 150
-      : aiModel === "gemini"
-      ? ((usage.inTok * 0.3 + usage.outTok * 2.5) / 1e6) * 150
-      : null;
+  const USAGE_LABELS = { claude: "Sonnet", "claude-opus": "Opus", gemini: "Gemini" };
 
   if (!authed) return <LoginGate onSuccess={() => setAuthed(true)} />;
 
@@ -942,14 +949,13 @@ ${correctionReason.trim() || "(コメントなし)"}
               title="読み取りに使うAIモデル"
               className="rounded border border-slate-300 bg-white px-2 py-1 text-[11px] text-slate-600 focus:border-slate-500 focus:outline-none"
             >
-              <option value="claude">Claude Sonnet (標準)</option>
+              <option value="gemini">Gemini Flash (標準)</option>
               <option value="claude-opus">Claude Opus (高精度)</option>
-              <option value="gemini">Gemini Flash (低コスト)</option>
             </select>
             <button onClick={() => setShowLessons(!showLessons)} className="rounded border border-slate-300 px-2 py-1 text-[11px] text-slate-600 transition hover:border-slate-500">
               🧠 教訓 ({lessons.length})
             </button>
-            <span className="rounded border border-slate-300 px-2 py-0.5 text-[10px] tracking-widest text-slate-500">web v1.2</span>
+            <span className="rounded border border-slate-300 px-2 py-0.5 text-[10px] tracking-widest text-slate-500">web v1.3</span>
           </div>
         </div>
       </header>
@@ -1340,11 +1346,17 @@ ${correctionReason.trim() || "(コメントなし)"}
               CSVはExcel対応 (UTF-8 BOM付き)。帳簿モードのCSVには検算結果列が含まれます。
               「Slackへ送信」はサーバーに SLACK_WEBHOOK_URL が設定されている場合に使えます。
             </p>
-            <p className="mt-1 text-[11px] text-slate-400">
-              今セッションのAPI使用: 入力 {usage.inTok.toLocaleString()} / 出力 {usage.outTok.toLocaleString()} tokens
-              {usage.inTok > 0 && estYen !== null && <> ・概算 約{estYen < 1 ? estYen.toFixed(2) : Math.round(estYen).toLocaleString()}円 (単価は要確認)</>}
-              {usage.inTok > 0 && estYen === null && <> ・(このモデルの単価は未確認のため概算なし)</>}
-            </p>
+            {Object.keys(usage).length > 0 && (
+              <p className="mt-1 text-[11px] text-slate-400">
+                今セッションのAPI使用 (モデル別):{" "}
+                {Object.entries(usage).map(([m, u]) => (
+                  <span key={m} className="mr-3 font-mono">
+                    {USAGE_LABELS[m] || m}: {u.calls}回 入力{u.inTok.toLocaleString()}/出力{u.outTok.toLocaleString()}
+                  </span>
+                ))}
+                — 単価確認のうえ金額を確定します (ページ再読み込みでリセット)
+              </p>
+            )}
           </div>
         </section>
       </main>
