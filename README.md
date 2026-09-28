@@ -29,8 +29,14 @@ Cloudflare Pages + Pages Functions に移植したもの。
 - **出力**: CSV ダウンロード / クリップボード / Slack (Incoming Webhook)
 - **認証**: 共有パスワード1つ (v1)。APIキーはサーバー側にのみ保持
 
-## デプロイ (Cloudflare Pages)
+## デプロイ (Cloudflare Workers または Pages)
 
+### Workers として接続した場合 (現行の推奨・本リポジトリ対応済み)
+- Build command: `npm run build` / Deploy command: `npx wrangler deploy`
+- `wrangler.jsonc` が Worker (worker/index.js = /api/* ルーター) と静的アセット (dist/) を定義
+- `keep_vars: true` によりダッシュボード設定の環境変数はデプロイで消えない
+
+### Pages として接続した場合
 1. このリポジトリを Cloudflare Pages に接続
    - Build command: `npm run build`
    - Build output directory: `dist`

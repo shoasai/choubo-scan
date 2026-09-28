@@ -1,0 +1,12 @@
+{
+  "name": "choubo-scan",
+  "main": "worker/index.js",
+  "compatibility_date": "2026-09-01",
+  // ダッシュボードで設定した環境変数を wrangler deploy が消さないようにする
+  "keep_vars": true,
+  "assets": {
+    "directory": "./dist",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application"
+  }
+}
