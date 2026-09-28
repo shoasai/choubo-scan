@@ -1410,7 +1410,7 @@ function BenchPanel({ ledgerRows, chain, model }) {
         gtRef.current = { rowCount: lines.length, balances };
       }
       const gt = gtRef.current;
-      const balances = ledgerRows.map((r) => toNum(r.balance)).filter((v) => v !== null);
+      const balances = [...new Set(ledgerRows.map((r) => toNum(r.balance)).filter((v) => v !== null))];
       const hit = balances.filter((v) => gt.balances.has(v)).length;
       const okCnt = ledgerRows.filter((r) => chain[r.id]?.status === "ok").length;
       const misCnt = ledgerRows.filter((r) => chain[r.id]?.status === "mismatch").length;
