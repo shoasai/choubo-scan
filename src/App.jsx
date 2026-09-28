@@ -427,26 +427,29 @@ function csvEscape(v) {
 }
 
 function buildReceiptCsv(rows) {
-  const header = RECEIPT_COLUMNS.map((c) => c.label).join(",");
-  const lines = rows.map((r) =>
-    RECEIPT_COLUMNS.map((c) => {
+  const header = [...RECEIPT_COLUMNS.map((c) => c.label), "確認"].join(",");
+  const lines = rows.map((r) => {
+    const cells = RECEIPT_COLUMNS.map((c) => {
       let v = r[c.key];
       if (c.key === "qualified") v = v === true ? "適格" : v === false ? "非適格" : "";
       return csvEscape(v);
-    }).join(",")
-  );
+    });
+    const state = r.reviewed ? "確認済" : r.confidence < 0.7 ? "要確認" : "";
+    return [...cells, csvEscape(state)].join(",");
+  });
   return "﻿" + [header, ...lines].join("\n");
 }
 
 function buildLedgerCsv(rows, chain) {
-  const header = [...LEDGER_COLUMNS.map((c) => c.label), "検算", "備考"].join(",");
+  const header = [...LEDGER_COLUMNS.map((c) => c.label), "検算", "確認", "備考"].join(",");
   const lines = rows.map((r) => {
     const c = chain[r.id] || {};
     const check =
       c.status === "ok" ? "OK" :
       c.status === "mismatch" ? `不一致(計算:${c.expected})` :
       c.status === "start" ? "繰越" : "-";
-    return [...LEDGER_COLUMNS.map((col) => csvEscape(r[col.key])), csvEscape(check), csvEscape(r.note)].join(",");
+    const state = r.reviewed ? "確認済" : c.status === "mismatch" || r.confidence < 0.7 ? "要確認" : "";
+    return [...LEDGER_COLUMNS.map((col) => csvEscape(r[col.key])), csvEscape(check), csvEscape(state), csvEscape(r.note)].join(",");
   });
   return "﻿" + [header, ...lines].join("\n");
 }
@@ -505,6 +508,7 @@ export default function ReceiptScanPoc() {
     return () => window.removeEventListener("api-usage", h);
   }, []);
   const [slackSending, setSlackSending] = useState(false);
+  const [showOnlyReview, setShowOnlyReview] = useState(false);
 
   // ---------- 永続データ ----------
   useEffect(() => {
@@ -772,10 +776,11 @@ export default function ReceiptScanPoc() {
 
   function resolveQuestion(q, action) {
     if (action === "adopt" && q.type === "chain") {
-      setLedgerRows((p) => p.map((r) => (r.id === q.rowId ? { ...r, balance: q.expected, note: [r.note, "残高を計算値に修正"].filter(Boolean).join(" / ") } : r)));
-    }
-    if (action === "keep" && q.type === "chain") {
-      setLedgerRows((p) => p.map((r) => (r.id === q.rowId ? { ...r, note: [r.note, "記載どおり(記帳ミスの可能性)"].filter(Boolean).join(" / ") } : r)));
+      setLedgerRows((p) => p.map((r) => (r.id === q.rowId ? { ...r, balance: q.expected, reviewed: true, note: [r.note, "残高を計算値に修正"].filter(Boolean).join(" / ") } : r)));
+    } else if (action === "keep" && q.type === "chain") {
+      setLedgerRows((p) => p.map((r) => (r.id === q.rowId ? { ...r, reviewed: true, note: [r.note, "記載どおり(記帳ミスの可能性)"].filter(Boolean).join(" / ") } : r)));
+    } else {
+      setLedgerRows((p) => p.map((r) => (r.id === q.rowId ? { ...r, reviewed: true } : r)));
     }
     setDismissed((p) => new Set([...p, q.qid]));
   }
@@ -784,6 +789,10 @@ export default function ReceiptScanPoc() {
   function updateRow(kind, id, key, value) {
     const setter = kind === "receipt" ? setReceiptRows : setLedgerRows;
     setter((p) => p.map((r) => (r.id === id ? { ...r, [key]: value } : r)));
+  }
+  function toggleReviewed(kind, id) {
+    const setter = kind === "receipt" ? setReceiptRows : setLedgerRows;
+    setter((p) => p.map((r) => (r.id === id ? { ...r, reviewed: !r.reviewed } : r)));
   }
   function removeRow(kind, id) {
     const setter = kind === "receipt" ? setReceiptRows : setLedgerRows;
@@ -891,8 +900,13 @@ ${correctionReason.trim() || "(コメントなし)"}
   const correctionRow = correctionTarget
     ? (correctionTarget.kind === "receipt" ? receiptRows : ledgerRows).find((r) => r.id === correctionTarget.id)
     : null;
-  const lowConfReceipts = receiptRows.filter((r) => r.confidence < 0.7).length;
+  const needsReceiptReview = (r) => !r.reviewed && r.confidence < 0.7;
+  const needsLedgerReview = (r) => !r.reviewed && (chain[r.id]?.status === "mismatch" || r.confidence < 0.7);
+  const lowConfReceipts = receiptRows.filter(needsReceiptReview).length;
   const mismatchCount = ledgerRows.filter((r) => chain[r.id]?.status === "mismatch").length;
+  const ledgerReviewCount = ledgerRows.filter(needsLedgerReview).length;
+  const visibleReceiptRows = showOnlyReview ? receiptRows.filter(needsReceiptReview) : receiptRows;
+  const visibleLedgerRows = showOnlyReview ? ledgerRows.filter(needsLedgerReview) : ledgerRows;
   const errorItems = items.filter((i) => i.status === "error");
 
   const acceptTypes = mode === "excel" ? ".xlsx,.xls,.csv" : "image/*,application/pdf";
@@ -1077,10 +1091,25 @@ ${correctionReason.trim() || "(コメントなし)"}
               <h2 className="text-sm font-bold">{mode === "excel" ? "検算レポート" : "抽出結果を確認・修正"}</h2>
             </div>
             {mode === "receipt" && receiptRows.length > 0 && (
-              <span className="text-xs text-slate-500">{receiptRows.length} 件{lowConfReceipts > 0 && <span className="ml-2 text-amber-600">⚠ 要確認 {lowConfReceipts}</span>}</span>
+              <span className="flex items-center gap-2 text-xs text-slate-500">
+                {receiptRows.length} 件
+                {lowConfReceipts > 0 ? <span className="text-amber-600">⚠ 要確認 {lowConfReceipts}</span> : <span className="text-emerald-600">✓ 全件確認済み</span>}
+                <label className="flex cursor-pointer items-center gap-1 rounded border border-slate-300 px-2 py-0.5 text-[11px]">
+                  <input type="checkbox" checked={showOnlyReview} onChange={(e) => setShowOnlyReview(e.target.checked)} />
+                  要確認のみ表示
+                </label>
+              </span>
             )}
             {mode === "ledger" && ledgerRows.length > 0 && (
-              <span className="text-xs text-slate-500">{ledgerRows.length} 行{mismatchCount > 0 ? <span className="ml-2 text-red-600">✗ 残高不一致 {mismatchCount}</span> : <span className="ml-2 text-emerald-600">✓ 検算OK</span>}</span>
+              <span className="flex items-center gap-2 text-xs text-slate-500">
+                {ledgerRows.length} 行
+                {mismatchCount > 0 && <span className="text-red-600">✗ 残高不一致 {mismatchCount}</span>}
+                {ledgerReviewCount > 0 ? <span className="text-amber-600">⚠ 要確認 {ledgerReviewCount}</span> : <span className="text-emerald-600">✓ 全件確認済み</span>}
+                <label className="flex cursor-pointer items-center gap-1 rounded border border-slate-300 px-2 py-0.5 text-[11px]">
+                  <input type="checkbox" checked={showOnlyReview} onChange={(e) => setShowOnlyReview(e.target.checked)} />
+                  要確認のみ表示
+                </label>
+              </span>
             )}
           </div>
 
@@ -1091,13 +1120,21 @@ ${correctionReason.trim() || "(コメントなし)"}
               <table className="w-full min-w-[920px] text-xs">
                 <thead>
                   <tr className="border-b-2 border-slate-900 bg-slate-100 text-left">
+                    <th className="w-10 px-2 py-2 font-semibold">確認</th>
                     {RECEIPT_COLUMNS.map((c) => <th key={c.key} className={`px-2 py-2 font-semibold ${c.width}`}>{c.label}</th>)}
                     <th className="w-20 px-2 py-2 font-semibold">操作</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {receiptRows.map((r) => (
-                    <tr key={r.id} className={`border-b border-slate-100 ${r.confidence < 0.7 ? "bg-amber-50" : ""}`}>
+                  {visibleReceiptRows.map((r) => (
+                    <tr key={r.id} className={`border-b border-slate-100 ${needsReceiptReview(r) ? "bg-amber-50" : ""}`}>
+                      <td className="px-1 py-1 text-center">
+                        <ReviewMark
+                          needsReview={r.confidence < 0.7}
+                          reviewed={!!r.reviewed}
+                          onToggle={() => toggleReviewed("receipt", r.id)}
+                        />
+                      </td>
                       {RECEIPT_COLUMNS.map((c) => (
                         <td key={c.key} className="px-1 py-1" title={c.key === "amount" && r.amount_reading ? `AIの読み上げ過程: ${r.amount_reading}` : undefined}>
                           {c.key === "qualified" ? (
@@ -1132,17 +1169,26 @@ ${correctionReason.trim() || "(コメントなし)"}
                 <thead>
                   <tr className="border-b-2 border-slate-900 bg-slate-100 text-left">
                     <th className="w-8 px-2 py-2 font-semibold">#</th>
+                    <th className="w-10 px-2 py-2 font-semibold">確認</th>
                     {LEDGER_COLUMNS.map((c) => <th key={c.key} className={`px-2 py-2 font-semibold ${c.width}`}>{c.label}</th>)}
                     <th className="w-32 px-2 py-2 font-semibold">検算</th>
                     <th className="w-14 px-2 py-2 font-semibold">操作</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {ledgerRows.map((r, i) => {
+                  {visibleLedgerRows.map((r) => {
+                    const i = ledgerRows.indexOf(r);
                     const c = chain[r.id] || {};
                     return (
-                      <tr key={r.id} className={`border-b border-slate-100 ${c.status === "mismatch" ? "bg-red-50" : r.confidence < 0.7 ? "bg-amber-50" : ""}`}>
+                      <tr key={r.id} className={`border-b border-slate-100 ${!needsLedgerReview(r) ? "" : c.status === "mismatch" ? "bg-red-50" : "bg-amber-50"}`}>
                         <td className="px-2 py-1 font-mono text-slate-400">{i + 1}</td>
+                        <td className="px-1 py-1 text-center">
+                          <ReviewMark
+                            needsReview={c.status === "mismatch" || r.confidence < 0.7}
+                            reviewed={!!r.reviewed}
+                            onToggle={() => toggleReviewed("ledger", r.id)}
+                          />
+                        </td>
                         {LEDGER_COLUMNS.map((col) => (
                           <td key={col.key} className="px-1 py-1">
                             <input value={r[col.key] ?? ""} onChange={(e) => updateRow("ledger", r.id, col.key, e.target.value)}
@@ -1416,6 +1462,31 @@ function BenchPanel({ ledgerRows, chain, model }) {
         </table>
       )}
     </details>
+  );
+}
+
+function ReviewMark({ needsReview, reviewed, onToggle }) {
+  if (reviewed) {
+    return (
+      <button onClick={onToggle} title="確認済み (クリックで戻す)"
+        className="rounded-full border border-emerald-300 bg-emerald-50 px-1.5 py-0.5 text-[11px] font-bold text-emerald-600 hover:bg-emerald-100">
+        ✓
+      </button>
+    );
+  }
+  if (needsReview) {
+    return (
+      <button onClick={onToggle} title="要確認 (原本と照合したらクリックで確認済みに)"
+        className="rounded-full border border-amber-400 bg-amber-100 px-1.5 py-0.5 text-[11px] font-bold text-amber-700 hover:bg-amber-200">
+        ⚠
+      </button>
+    );
+  }
+  return (
+    <button onClick={onToggle} title="クリックで確認済みマークを付ける"
+      className="rounded-full border border-transparent px-1.5 py-0.5 text-[11px] text-slate-300 hover:border-slate-300 hover:text-slate-500">
+      ○
+    </button>
   );
 }
 
