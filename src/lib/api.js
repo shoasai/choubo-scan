@@ -24,12 +24,26 @@ export function setCurrentModel(m) {
 }
 
 export async function login(password) {
-  const r = await fetch("/api/login", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ password }),
-  });
-  return r.ok;
+  let r;
+  try {
+    r = await fetch("/api/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ password }),
+    });
+  } catch {
+    return { ok: false, error: "サーバーに接続できません (ネットワークを確認してください)" };
+  }
+  const d = await r.json().catch(() => null);
+  // d が JSON でない = /api/* が Functions として動いていない (SPAのHTMLや404が返っている)
+  if (!d) {
+    return {
+      ok: false,
+      error: `API が応答していません (HTTP ${r.status})。Cloudflare で「Pages」プロジェクトとして接続されているか、最新のデプロイが環境変数設定後に実行されたかを確認してください`,
+    };
+  }
+  if (r.ok && d.ok) return { ok: true };
+  return { ok: false, error: d.error || `HTTP ${r.status}` };
 }
 
 function authFailed() {

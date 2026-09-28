@@ -1304,16 +1304,12 @@ function LoginGate({ onSuccess }) {
     if (!pw) return;
     setBusy(true);
     setErr("");
-    try {
-      const ok = await login(pw);
-      if (ok) {
-        setPassword(pw);
-        onSuccess();
-      } else {
-        setErr("パスワードが違います");
-      }
-    } catch {
-      setErr("サーバーに接続できません");
+    const res = await login(pw);
+    if (res.ok) {
+      setPassword(pw);
+      onSuccess();
+    } else {
+      setErr(res.error || "ログインに失敗しました");
     }
     setBusy(false);
   }
