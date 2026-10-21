@@ -9,14 +9,20 @@
     "binding": "ASSETS",
     "not_found_handling": "single-page-application"
   },
-  // 案件・行・教訓などの保存先 (仕様書 v0.4 §3)
-  // database_id は Cloudflare で D1 を作成したあとに差し替える (README「D1 の作成」参照)
-  "d1_databases": [
-    {
-      "binding": "DB",
-      "database_name": "choubo-scan",
-      "database_id": "REPLACE_WITH_D1_DATABASE_ID",
-      "migrations_dir": "migrations"
+  // 本番 (トップレベル) には D1 をまだ設定していない。
+  //   → 本番では案件機能は無効 (API は 501・画面の案件パネルは非表示)。既存の読み取り機能だけが動く。
+  // 本番で使うときは D1 を作成し、env.local と同じ d1_databases を実際の database_id でトップレベルに追加する。
+  "env": {
+    // ローカル開発専用: npx wrangler dev --env local
+    "local": {
+      "d1_databases": [
+        {
+          "binding": "DB",
+          "database_name": "choubo-scan-local",
+          "database_id": "local-only",
+          "migrations_dir": "migrations"
+        }
+      ]
     }
-  ]
+  }
 }

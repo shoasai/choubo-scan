@@ -189,6 +189,7 @@ export default function ReceiptScanPoc() {
   const [dirty, setDirty] = useState(() => new Set()); // 未保存の行ID
   const deletedRef = useRef(new Set()); // 案件から削除した行ID (保存時に送る)
   const [batchList, setBatchList] = useState(null);
+  const [batchAvailable, setBatchAvailable] = useState(false); // サーバーに D1 が設定されているときだけ案件機能を出す
   const [showBatchList, setShowBatchList] = useState(false);
   const [batchBusy, setBatchBusy] = useState(false);
   const [batchReasons, setBatchReasons] = useState([]);
@@ -750,6 +751,16 @@ export default function ReceiptScanPoc() {
     }
   }
 
+  // 案件機能が使えるか (本番で D1 未設定なら 501 → パネルを出さない)
+  useEffect(() => {
+    if (!authed) return;
+    let alive = true;
+    batchApi.list()
+      .then((d) => { if (alive) { setBatchAvailable(true); setBatchList(d.batches || []); } })
+      .catch(() => { if (alive) setBatchAvailable(false); });
+    return () => { alive = false; };
+  }, [authed]);
+
   // 未保存の変更があるときは離脱前に確認
   useEffect(() => {
     if (!batch || dirty.size === 0) return;
@@ -933,7 +944,7 @@ export default function ReceiptScanPoc() {
         )}
 
         {/* 案件 (サーバー保存) */}
-        {mode === "receipt" && (
+        {mode === "receipt" && batchAvailable && (
           <BatchPanel
             batch={batch}
             locked={batchLocked}

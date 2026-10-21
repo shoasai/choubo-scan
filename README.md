@@ -65,20 +65,20 @@ npx wrangler pages dev dist      # Functions込みでローカル起動
 
 UIのみの高速開発は `npm run dev` (この場合 /api/* は動かない)。
 
-### 案件機能 (実証 段階1・ブランチ pilot/stage1) をローカルで動かす
+### 案件機能 (実証) をローカルで動かす
 
-案件の保存・途中保存・再表示・確定は Cloudflare D1 を使う。ローカルでは本番に影響しない。
+案件の保存・途中保存・再表示・確定は Cloudflare D1 を使う。D1 はローカル開発用 (`wrangler.jsonc` の `env.local`) にだけ設定してあり、本番には未設定。
 
 ```bash
 npm run build
-npx wrangler d1 migrations apply DB --local   # ローカルD1にテーブル作成
-npx wrangler dev                              # Worker として起動 (http://127.0.0.1:8787)
-npm test                                      # 共通処理の単体テスト
-npm run test:e2e                              # 案件APIの通し確認 (wrangler dev 起動中・ローカル専用)
+npm run db:migrate:local   # ローカルD1にテーブル作成 (wrangler d1 migrations apply DB --local --env local)
+npm run dev:worker         # Worker として起動 (wrangler dev --env local → http://127.0.0.1:8787)
+npm test                   # 共通処理の単体テスト
+npm run test:e2e           # 案件APIの通し確認 (dev:worker 起動中・ローカル専用)
 ```
 
-本番で使うには、事前に D1 の作成と `wrangler.jsonc` の `database_id` 設定、リモートへのマイグレーションが必要 (未実施。実施前に確認すること)。
-D1 未設定のまま本番に出した場合、既存の読み取り機能は動き、案件機能だけが「データベースが設定されていません」と表示される。
+本番では D1 が無いので、案件API は 501 を返し、画面の案件パネルは表示されない (既存の読み取り機能だけが動く)。
+本番で案件機能を使うときは、D1 を作成して `env.local` と同じ `d1_databases` を実際の `database_id` でトップレベルに追加し、`npx wrangler d1 migrations apply DB --remote` を実行する (費用・タイミングは事前に確認すること)。
 
 ## コストについて (要確認)
 
