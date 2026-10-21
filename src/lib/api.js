@@ -134,3 +134,55 @@ export async function sendSlack(text) {
   if (!r.ok) throw new Error(d.error || "HTTP " + r.status);
   return true;
 }
+
+// ---------- 案件 (サーバー保存) ----------
+// 失敗時は Error に status / code / reasons を付けて投げる
+async function staffFetch(method, path, body) {
+  const r = await fetch(path, {
+    method,
+    headers: {
+      ...(body !== undefined ? { "Content-Type": "application/json" } : {}),
+      "x-app-password": getPassword(),
+    },
+    body: body !== undefined ? JSON.stringify(body) : undefined,
+  });
+  if (r.status === 401) {
+    authFailed();
+    throw new Error("認証エラー: パスワードを再入力してください");
+  }
+  return r;
+}
+
+async function staffJson(method, path, body) {
+  const r = await staffFetch(method, path, body);
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) {
+    const err = new Error(d.error || `HTTP ${r.status}`);
+    err.status = r.status;
+    err.code = d.code;
+    err.reasons = d.reasons;
+    throw err;
+  }
+  return d;
+}
+
+export const batchApi = {
+  list: () => staffJson("GET", "/api/batches"),
+  create: (payload) => staffJson("POST", "/api/batches", payload),
+  get: (id) => staffJson("GET", `/api/batches/${encodeURIComponent(id)}`),
+  save: (id, rev, changes) => staffJson("PUT", `/api/batches/${encodeURIComponent(id)}/items`, { rev, changes }),
+  confirm: (id, rev) => staffJson("POST", `/api/batches/${encodeURIComponent(id)}/confirm`, { rev }),
+  reopen: (id, rev) => staffJson("POST", `/api/batches/${encodeURIComponent(id)}/reopen`, { rev }),
+  resolveWarning: (id, wid) =>
+    staffJson("POST", `/api/batches/${encodeURIComponent(id)}/warnings/${encodeURIComponent(wid)}/resolve`, {}),
+  async exportCsv(id, exportId) {
+    const r = await staffFetch("GET", `/api/batches/${encodeURIComponent(id)}/exports/${encodeURIComponent(exportId)}/csv`);
+    if (!r.ok) {
+      const d = await r.json().catch(() => ({}));
+      throw new Error(d.error || `HTTP ${r.status}`);
+    }
+    const cd = r.headers.get("Content-Disposition") || "";
+    const m = cd.match(/filename\*=UTF-8''([^;]+)/);
+    return { blob: await r.blob(), filename: m ? decodeURIComponent(m[1]) : "batch.csv" };
+  },
+};

@@ -65,6 +65,21 @@ npx wrangler pages dev dist      # Functions込みでローカル起動
 
 UIのみの高速開発は `npm run dev` (この場合 /api/* は動かない)。
 
+### 案件機能 (実証) をローカルで動かす
+
+案件の保存・途中保存・再表示・確定は Cloudflare D1 を使う。D1 はローカル開発用 (`wrangler.jsonc` の `env.local`) にだけ設定してあり、本番には未設定。
+
+```bash
+npm run build
+npm run db:migrate:local   # ローカルD1にテーブル作成 (wrangler d1 migrations apply DB --local --env local)
+npm run dev:worker         # Worker として起動 (wrangler dev --env local → http://127.0.0.1:8787)
+npm test                   # 共通処理の単体テスト
+npm run test:e2e           # 案件APIの通し確認 (dev:worker 起動中・ローカル専用)
+```
+
+本番では D1 が無いので、案件API は 501 を返し、画面の案件パネルは表示されない (既存の読み取り機能だけが動く)。
+本番で案件機能を使うときは、D1 を作成して `env.local` と同じ `d1_databases` を実際の `database_id` でトップレベルに追加し、`npx wrangler d1 migrations apply DB --remote` を実行する (費用・タイミングは事前に確認すること)。
+
 ## コストについて (要確認)
 
 - 帳簿見開き1枚 ≒ 4分割 × (画像+プロンプト+出力)。Sonnet で概算 15〜25円/枚、Gemini Flash で 1〜3円/枚の見込みだが、**単価・実測トークン数ともに要確認**
@@ -83,6 +98,12 @@ functions/api/         # Cloudflare Pages Functions
   slack.js             #   Slack Incoming Webhook 送信
 public/bench/          # ベンチマーク正解データ (手書き帳簿71行・検算済み)
 docs/SPEC-full-v0.3.md # 本格版 (Supabase・JDL連携・マルチテナント) の仕様書
+docs/SPEC-pilot-v0.4.md # 税理士事務所向け実証 (提出URL→OCR→確認→Drive) の仕様書
+src/core/              # 画面とサーバーで共有する処理 (列定義・プロンプト・解析・検算・CSV)
+worker/index.js        # Workers エントリ (静的配信 + /api/*)
+worker/routes/         # 案件API (D1)
+migrations/            # D1 スキーマ
+tests/                 # 単体テスト (npm test) / e2e (npm run test:e2e)
 ```
 
 ## ロードマップ
