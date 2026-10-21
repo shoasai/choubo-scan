@@ -8,5 +8,15 @@
     "directory": "./dist",
     "binding": "ASSETS",
     "not_found_handling": "single-page-application"
-  }
+  },
+  // 案件・行・教訓などの保存先 (仕様書 v0.4 §3)
+  // database_id は Cloudflare で D1 を作成したあとに差し替える (README「D1 の作成」参照)
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "choubo-scan",
+      "database_id": "REPLACE_WITH_D1_DATABASE_ID",
+      "migrations_dir": "migrations"
+    }
+  ]
 }

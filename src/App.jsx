@@ -1,7 +1,13 @@
 import { useState, useRef, useEffect, useMemo } from "react";
 import * as XLSX from "xlsx";
-import { callClaudeFull, callClaude, setCurrentModel, getPassword, setPassword, login, sendSlack } from "./lib/api.js";
+import { callClaudeFull, callClaude, setCurrentModel, getPassword, setPassword, login, sendSlack, batchApi } from "./lib/api.js";
 import { appStorage } from "./lib/store.js";
+import { RECEIPT_COLUMNS, LEDGER_COLUMNS, FIELD_LABELS } from "./core/columns.js";
+import { RECEIPT_PROMPT, LEDGER_PROMPT, COLUMN_MAP_PROMPT, formatLessonsBlock, buildLessonPrompt } from "./core/prompts.js";
+import { repairJson, toNum } from "./core/parse.js";
+import { receiptRowsFromAiText, snapshotReceiptOriginal, pickReceiptFields } from "./core/receipt.js";
+import { computeChain, mergeLedgerParts, normalizeLedgerRows } from "./core/ledger.js";
+import { buildReceiptCsv, buildLedgerCsv, buildExcelReportCsv } from "./core/csv.js";
 
 // ==================== 定数 ====================
 const MODE_KEY = "receipt-poc-mode";
@@ -13,109 +19,10 @@ const MODES = [
   { id: "excel", label: "帳簿チェック(Excel)", icon: "📊", desc: "Excel/CSV帳簿の残高検算レポート" },
 ];
 
-const RECEIPT_COLUMNS = [
-  { key: "date", label: "日付", width: "w-28" },
-  { key: "vendor", label: "店舗名 / 摘要", width: "w-44" },
-  { key: "amount", label: "金額(税込)", width: "w-24", align: "right" },
-  { key: "tax_rate", label: "税率", width: "w-16" },
-  { key: "qualified", label: "適格", width: "w-14" },
-  { key: "invoice_number", label: "インボイス番号", width: "w-40" },
-  { key: "account", label: "勘定科目候補", width: "w-28" },
-  { key: "note", label: "備考", width: "w-36" },
-];
-
-const LEDGER_COLUMNS = [
-  { key: "date", label: "月日", width: "w-20" },
-  { key: "summary", label: "摘要", width: "w-56" },
-  { key: "income", label: "収入金額", width: "w-24", align: "right" },
-  { key: "payment", label: "支払金額", width: "w-24", align: "right" },
-  { key: "balance", label: "差引残高", width: "w-28", align: "right" },
-];
-
-const FIELD_LABELS = {
-  date: "日付", vendor: "店舗名/摘要", amount: "金額", tax_rate: "税率",
-  qualified: "適格", invoice_number: "インボイス番号", account: "勘定科目",
-  note: "備考", summary: "摘要", income: "収入金額", payment: "支払金額", balance: "差引残高",
-};
+// 列定義: src/core/columns.js
 
 // ==================== プロンプト ====================
-const RECEIPT_PROMPT = `あなたは日本のレシート・領収書の読み取り専門AIです。
-この画像/PDFを読み取り、以下のJSON形式のみで返答してください。前置きやMarkdownの\`\`\`は一切不要です。
-
-{
-  "rows": [
-    {
-      "date": "YYYY-MM-DD (不明ならnull)",
-      "vendor": "店舗名または摘要",
-      "amount_reading": "金額欄の文字を左から1文字ずつ読み上げ、検討過程を書き、最後に必ず『結論: N円』で締める (例: '先頭マス:￥(7と酷似だが記号と判断) / 1,2,6,0,0 → 結論: 12600円')",
-      "amount": 数値(amount_reading の『結論: N円』の N をそのまま転記する。読み上げと異なる値を書いてはならない。不明ならnull),
-      "tax_amount": 数値(内消費税額の記載があれば・なければnull),
-      "tax_rate": "10%" | "8%" | "非課税" | null,
-      "qualified": true | false | null,
-      "invoice_number": "T+13桁 (なければnull)",
-      "account": "勘定科目の推測(会議費/旅費交通費/消耗品費/新聞図書費/接待交際費/通信費/雑費など)",
-      "note": "特記事項・読み取りに自信がない箇所",
-      "confidence": 0.0〜1.0
-    }
-  ]
-}
-
-【フィールドの生成順序 (絶対厳守)】
-- 必ず amount_reading を先に書き、そこで桁の検討を完結させてから、その結論の数値だけを amount に転記する。
-
-ルール:
-- 1枚の画像・1ページに複数の領収書がある場合は、それぞれ1行ずつ抽出。PDFは全ページ処理。
-- 「合計」「お預り」「お釣り」を混同しない。amount は支払合計。
-- 手書きの￥は数字の7と酷似する。先頭の文字は通貨記号の可能性を必ず最初に検討。金額欄のマス目形式では先頭マスに￥が書かれる慣習がある。
-- 訂正線がある場合は訂正後の値を採用し note に記載。
-- 5万円以上の領収書には通常「収入印紙」が貼られる。印紙が見当たらないのに5万円以上と読めた場合、桁の誤読を疑い再読する。
-- 内消費税の記載があれば tax_amount に。税込10%なら 税額≈金額×10/110。合わなければ誤読を疑う。
-- 和暦は西暦に変換(令和8年=2026年)。
-- 読み取れない箇所は null にして note に「要確認: 〜」と記載し confidence を下げる。
-- JSON以外の文字を出力しない。`;
-
-const LEDGER_PROMPT = `あなたは日本の手書き帳簿(金銭出納帳・現金出納帳)の読み取り専門AIです。
-この画像は帳簿ページの一部分(分割画像)です。写っている行を上から順にすべて読み取り、以下のJSON形式のみで返答してください。前置きやMarkdownの\`\`\`は一切不要です。
-
-{"rows":[{"d":"4/1","s":"前年度繰越金","i":null,"p":null,"b":188814,"c":1,"n":"","f":0.9}]}
-
-各キーの意味:
-- d: 月日 (記載どおり。〃や空欄は直前の行と同じ日付として補完)
-- s: 摘要 (書いてある文字の転記のみ)
-- i: 収入金額 / p: 支払金額 / b: 差引残高 (数値・なければnull)
-- c: 繰越行(「繰越」「前年度繰越金」「前ページより」等)なら1、通常行は0
-- n: 読み取りに自信がない箇所の短いメモ (自信がある行は "")
-- f: 確度 0.0〜1.0
-
-【創作の禁止 (最重要)】
-- 摘要は書いてある文字の転記のみ。判読できない文字は1文字ごとに「?」に置き換える (例: "ビ?ター ?田")。
-- 画像から読み取れない語を推測で補うことは厳禁。それらしい一般語を創作してはならない。
-- 摘要が全く判読できない行は s を "?" とし f を 0.3 以下、? を含む行は f を 0.6 以下にする。
-
-ルール:
-- 各行で数値がどの列(収入/支払/残高)にあるかを罫線の位置で慎重に判定する。列ズレは厳禁。
-- 桁は1文字ずつ慎重に読む。4と9、1と7、0と6は誤読しやすい。読めない数値は null にして n に記載。
-- 訂正線・訂正印がある場合は訂正後の値を採用し n に記載。
-- 画像の上端・下端で途中で切れている行は出力しない (隣接する分割画像で処理される)。
-- 監査文言・署名・押印・ページ下部の合計/集計行はデータ行ではないので出力しない。
-- 残高の検算はしなくてよい (システム側で行う)。読み取った数字をそのまま出力する。
-- JSON以外の文字を出力しない。`;
-
-const COLUMN_MAP_PROMPT = `以下はExcel帳簿の先頭数行です。各列が何を表すかを判定し、以下のJSON形式のみで返答してください。
-
-{
-  "header_row": ヘッダー行のインデックス(0始まり・なければnull),
-  "date": 列インデックス(0始まり・なければnull),
-  "summary": 列インデックス,
-  "income": 列インデックス(収入・入金),
-  "payment": 列インデックス(支払・支出・出金),
-  "balance": 列インデックス(残高・差引残高)
-}
-
-JSON以外の文字を出力しない。
-
-データ:
-`;
+// プロンプト: src/core/prompts.js
 
 // ==================== ユーティリティ ====================
 function readAsDataURL(file) {
@@ -252,216 +159,12 @@ async function fileToRawBase64(file) {
 
 // ==================== AI呼び出し: src/lib/api.js (サーバープロキシ経由) ====================
 
-// 壊れたJSON (途中切れ・前置き混入) の修復パース
-function repairJson(text) {
-  let t = String(text).replace(/```json|```/g, "").trim();
-  const first = t.indexOf("{");
-  if (first > 0) t = t.slice(first);
-  if (first < 0) throw new Error("JSONが見つかりません (AIが形式外の応答)");
-  try {
-    return { data: JSON.parse(t), repaired: false };
-  } catch {}
-  // 末尾から '}' 境界ごとに切り詰めて括弧を閉じ直す
-  let idx = t.lastIndexOf("}");
-  for (let attempts = 0; idx > 0 && attempts < 120; attempts++) {
-    const cand = t.slice(0, idx + 1);
-    let open = 0, openSq = 0, inStr = false, esc = false, valid = true;
-    for (const ch of cand) {
-      if (esc) { esc = false; continue; }
-      if (ch === "\\") { esc = true; continue; }
-      if (ch === '"') { inStr = !inStr; continue; }
-      if (inStr) continue;
-      if (ch === "{") open++;
-      else if (ch === "}") { open--; if (open < 0) { valid = false; break; } }
-      else if (ch === "[") openSq++;
-      else if (ch === "]") { openSq--; if (openSq < 0) { valid = false; break; } }
-    }
-    if (valid && !inStr) {
-      try {
-        return { data: JSON.parse(cand + "]".repeat(openSq) + "}".repeat(open)), repaired: true };
-      } catch {}
-    }
-    idx = t.lastIndexOf("}", idx - 1);
-  }
-  throw new Error("JSONの解析に失敗 (出力形式が崩れています)");
-}
-
-function toNum(v) {
-  if (v === null || v === undefined || v === "") return null;
-  const n = Number(String(v).replace(/[,，¥￥\s]/g, ""));
-  return Number.isFinite(n) ? n : null;
-}
+// JSON修復・数値正規化: src/core/parse.js
 
 // ==================== 検証 ====================
-function parseReadingConclusion(reading) {
-  if (!reading) return null;
-  const matches = String(reading).match(/結論[:：]?\s*[¥￥]?\s*([\d,，]+)\s*円/g);
-  if (!matches || matches.length === 0) return null;
-  const num = matches[matches.length - 1].match(/([\d,，]+)\s*円/);
-  return num ? Number(num[1].replace(/[,，]/g, "")) : null;
-}
+// 領収書: src/core/receipt.js / 帳簿: src/core/ledger.js
 
-function validateReceiptRow(r) {
-  const warnings = [];
-  const conclusion = parseReadingConclusion(r.amount_reading);
-  if (conclusion !== null && Number(r.amount) !== conclusion) {
-    warnings.push(`AI出力不整合: 金額欄${r.amount}円 / 読み上げ結論${conclusion}円 → 結論側を採用。原本確認必須`);
-    r.amount = conclusion;
-    r.confidence = Math.min(r.confidence ?? 1, 0.5);
-  }
-  const amt = Number(r.amount);
-  if (amt >= 50000) warnings.push("5万円以上: 収入印紙・桁を確認");
-  if (r.tax_amount && amt && r.tax_rate === "10%") {
-    const expected = Math.round((amt * 10) / 110);
-    if (Math.abs(expected - Number(r.tax_amount)) > 2) {
-      warnings.push(`税額不整合: 記載${r.tax_amount}円 / 計算${expected}円`);
-    }
-  }
-  return warnings;
-}
-
-// 残高チェーン検算 (決定的・コード側で実施)
-// 残高が空欄の行は収入/支払を累積し、次に残高が記載された行でまとめて検算する
-function computeChain(rows) {
-  const result = {};
-  let prev = null; // 直近の確定残高
-  let acc = 0;     // 確定残高以降の収支の累積
-  for (const r of rows) {
-    const income = toNum(r.income);
-    const payment = toNum(r.payment);
-    const balance = toNum(r.balance);
-    if (r.is_carryover) {
-      result[r.id] = { status: "start", expected: null };
-      if (balance !== null) { prev = balance; acc = 0; }
-      continue;
-    }
-    acc += (income || 0) - (payment || 0);
-    if (balance === null) {
-      result[r.id] = { status: "unknown", expected: prev !== null ? prev + acc : null };
-      continue;
-    }
-    if (prev === null) {
-      result[r.id] = { status: "unknown", expected: null };
-      prev = balance;
-      acc = 0;
-      continue;
-    }
-    const expected = prev + acc;
-    result[r.id] = { status: expected === balance ? "ok" : "mismatch", expected };
-    prev = balance;
-    acc = 0;
-  }
-  return result;
-}
-
-// 数値ベースの行一致 (摘要の読み違いに影響されない・列入替も同一視)
-function rowNumEq(x, y) {
-  const xb = toNum(x.balance), yb = toNum(y.balance);
-  if (xb !== null && yb !== null) return xb === yb;
-  if (xb !== null || yb !== null) return false;
-  const xi = toNum(x.income), xp = toNum(x.payment);
-  const yi = toNum(y.income), yp = toNum(y.payment);
-  if (xi === null && xp === null && yi === null && yp === null) return false;
-  return (xi === yi && xp === yp) || (xi === yp && xp === yi);
-}
-
-// 分割パーツのマージ (オーバーラップ重複を数値署名で除去)
-function mergeLedgerParts(a, b) {
-  if (a.length === 0) return b;
-  for (let m = Math.min(10, a.length, b.length); m >= 1; m--) {
-    let all = true, strong = false;
-    for (let j = 0; j < m; j++) {
-      const x = a[a.length - m + j], y = b[j];
-      if (!rowNumEq(x, y)) { all = false; break; }
-      if (toNum(x.balance) !== null) strong = true;
-    }
-    if (all && (strong || m >= 2)) return [...a, ...b.slice(m)];
-  }
-  return [...a, ...b];
-}
-
-// マージ後の正規化: ジャンク行除去 + 収入/支払の列入替を検算で自動補正
-function normalizeLedgerRows(rows) {
-  const cleaned = rows.filter((r) => {
-    const noNums = toNum(r.income) === null && toNum(r.payment) === null && toNum(r.balance) === null;
-    const s = String(r.summary || "").replace(/[?？\s.。・〃~〜0-9-]/g, "");
-    return !(noNums && s.length <= 1);
-  });
-  const delta = (r) => (toNum(r.income) || 0) - (toNum(r.payment) || 0);
-  const swap = (r) => {
-    const t = r.income;
-    r.income = r.payment;
-    r.payment = t;
-    r.note = [r.note, "収入/支払を自動入替補正(検算一致)"].filter(Boolean).join(" / ");
-    r.confidence = Math.min(r.confidence ?? 1, 0.7);
-  };
-  let prev = null;
-  let seg = [];
-  for (const r of cleaned) {
-    const b = toNum(r.balance);
-    if (r.is_carryover) {
-      if (b !== null) prev = b;
-      seg = [];
-      continue;
-    }
-    seg.push(r);
-    if (b === null) continue;
-    if (prev !== null) {
-      const exp = prev + seg.reduce((s, x) => s + delta(x), 0);
-      if (exp !== b) {
-        if (exp - 2 * delta(r) === b) swap(r);
-        else if (prev - seg.reduce((s, x) => s + delta(x), 0) === b) seg.forEach(swap);
-      }
-    }
-    prev = b;
-    seg = [];
-  }
-  return cleaned;
-}
-
-// ==================== CSV ====================
-function csvEscape(v) {
-  if (v === null || v === undefined) v = "";
-  v = String(v).replace(/"/g, '""');
-  return /[",\n]/.test(v) ? `"${v}"` : v;
-}
-
-function buildReceiptCsv(rows) {
-  const header = [...RECEIPT_COLUMNS.map((c) => c.label), "確認"].join(",");
-  const lines = rows.map((r) => {
-    const cells = RECEIPT_COLUMNS.map((c) => {
-      let v = r[c.key];
-      if (c.key === "qualified") v = v === true ? "適格" : v === false ? "非適格" : "";
-      return csvEscape(v);
-    });
-    const state = r.reviewed ? "確認済" : r.confidence < 0.7 ? "要確認" : "";
-    return [...cells, csvEscape(state)].join(",");
-  });
-  return "﻿" + [header, ...lines].join("\n");
-}
-
-function buildLedgerCsv(rows, chain) {
-  const header = [...LEDGER_COLUMNS.map((c) => c.label), "検算", "確認", "備考"].join(",");
-  const lines = rows.map((r) => {
-    const c = chain[r.id] || {};
-    const check =
-      c.status === "ok" ? "OK" :
-      c.status === "mismatch" ? `不一致(計算:${c.expected})` :
-      c.status === "start" ? "繰越" : "-";
-    const state = r.reviewed ? "確認済" : c.status === "mismatch" || r.confidence < 0.7 ? "要確認" : "";
-    return [...LEDGER_COLUMNS.map((col) => csvEscape(r[col.key])), csvEscape(check), csvEscape(state), csvEscape(r.note)].join(",");
-  });
-  return "﻿" + [header, ...lines].join("\n");
-}
-
-function buildExcelReportCsv(report) {
-  const header = "行番号,月日,摘要,収入,支払,記載残高,計算残高,差額,判定";
-  const lines = report.rows.map((r) =>
-    [r.rowNo, r.date, r.summary, r.income, r.payment, r.balance, r.expected ?? "", r.diff ?? "", r.status === "mismatch" ? "不一致" : r.status === "start" ? "繰越" : r.status === "ok" ? "OK" : "-"]
-      .map(csvEscape).join(",")
-  );
-  return "﻿" + [header, ...lines].join("\n");
-}
+// ==================== CSV: src/core/csv.js ====================
 
 // ==================== メイン ====================
 export default function ReceiptScanPoc() {
@@ -481,6 +184,18 @@ export default function ReceiptScanPoc() {
   const [toast, setToast] = useState("");
   const fileRef = useRef(null);
   const idRef = useRef(0);
+  // ---- 案件 (サーバー保存) ----
+  const [batch, setBatch] = useState(null); // 開いている案件 { id, rev, review_state, title, warnings, exports, ... }
+  const [dirty, setDirty] = useState(() => new Set()); // 未保存の行ID
+  const deletedRef = useRef(new Set()); // 案件から削除した行ID (保存時に送る)
+  const [batchList, setBatchList] = useState(null);
+  const [showBatchList, setShowBatchList] = useState(false);
+  const [batchBusy, setBatchBusy] = useState(false);
+  const [batchReasons, setBatchReasons] = useState([]);
+  const [batchTitle, setBatchTitle] = useState("");
+  const submissionIdRef = useRef(null); // 同じ結果の再送では同じIDを使う
+  const sessionWarningsRef = useRef([]); // 読み取り時の警告 (出力途切れ・JSON修復)。案件保存時に永続化する
+  const batchLocked = batch?.review_state === "confirmed";
   const lessonsRef = useRef([]);
   lessonsRef.current = lessons;
 
@@ -561,9 +276,7 @@ export default function ReceiptScanPoc() {
   }
 
   function lessonsBlock() {
-    const ls = lessonsRef.current;
-    if (ls.length === 0) return "";
-    return `\n\n【過去の訂正から得た教訓 (必ず考慮すること)】\n${ls.map((l, i) => `${i + 1}. ${l.text}`).join("\n")}`;
+    return formatLessonsBlock(lessonsRef.current.map((l) => l.text));
   }
 
   function patchItem(id, patch) {
@@ -572,6 +285,10 @@ export default function ReceiptScanPoc() {
 
   // ---------- ファイル受付 ----------
   async function handleFiles(fileList) {
+    if (batch && mode === "receipt") {
+      showToast("案件を開いている間は新しい読み取りはできません。「案件を閉じる」を押してから読み込んでください");
+      return;
+    }
     const files = Array.from(fileList || []);
     for (const file of files) {
       if (mode === "excel") { await processExcel(file); continue; }
@@ -580,7 +297,7 @@ export default function ReceiptScanPoc() {
       let payload = null, preview = null, splitInfo = false;
       try {
         if (isPdf) {
-          payload = { kind: mode, pdfBase64: await fileToRawBase64(file) };
+          payload = { kind: mode, pdfBase64: await fileToRawBase64(file), fileName: file.name };
         } else if (mode === "ledger") {
           const p = await fileToLedgerParts(file);
           payload = { kind: "ledger", parts: p.parts };
@@ -588,7 +305,7 @@ export default function ReceiptScanPoc() {
           splitInfo = p.parts.length;
         } else {
           const p = await fileToReceiptImage(file);
-          payload = { kind: "receipt", base64: p.base64 };
+          payload = { kind: "receipt", base64: p.base64, fileName: file.name };
           preview = p.preview;
         }
       } catch (e) {
@@ -623,33 +340,24 @@ export default function ReceiptScanPoc() {
       ? { type: "document", source: { type: "base64", media_type: "application/pdf", data: payload.pdfBase64 } }
       : { type: "image", source: { type: "base64", media_type: "image/jpeg", data: payload.base64 } };
     const { text, stopReason } = await callClaudeFull([fileBlock, { type: "text", text: RECEIPT_PROMPT + lessonsBlock() }], 4000);
-    const { data, repaired } = repairJson(text);
-    const newRows = (data.rows || []).map((r) => {
-      const row = {
-        id: ++idRef.current, sourceId: id,
-        date: r.date || "", vendor: r.vendor || "",
-        amount: r.amount ?? "", amount_reading: r.amount_reading || "",
-        tax_amount: r.tax_amount ?? null, tax_rate: r.tax_rate || "",
-        qualified: r.qualified, invoice_number: r.invoice_number || "",
-        account: r.account || "", note: r.note || "",
-        confidence: r.confidence ?? 1,
-      };
-      const warnings = validateReceiptRow(row);
-      if (warnings.length > 0) {
-        row.note = [row.note, ...warnings].filter(Boolean).join(" / ");
-        row.confidence = Math.min(row.confidence, 0.6);
-      }
-      row.original = {
-        date: row.date, vendor: row.vendor, amount: row.amount,
-        tax_rate: row.tax_rate, qualified: row.qualified,
-        invoice_number: row.invoice_number, account: row.account,
-      };
-      return row;
-    });
+    const { rows: parsed, repaired } = receiptRowsFromAiText(text);
+    const newRows = parsed.map(({ ai_raw, auto, warnings }) => ({
+      id: ++idRef.current,
+      sourceId: id,
+      ...auto,
+      ai_raw, // AIの原値 (補正前)。サーバー保存時に使う
+      _auto: auto, // 検証・補正後の初期値 (人の編集前)
+      _warnings: warnings || [],
+      original: snapshotReceiptOriginal(auto), // 教訓用の差分の基準 (補正後・人の編集前)
+    }));
     setReceiptRows((p) => [...p, ...newRows]);
     patchItem(id, { status: "done", count: newRows.length });
     if (stopReason === "max_tokens" || repaired) {
       showToast("応答が長すぎて一部途切れた可能性があります。抽出漏れがないか件数を確認してください");
+      sessionWarningsRef.current.push({
+        code: stopReason === "max_tokens" ? "truncated" : "json_repaired",
+        message: `${payload.fileName || "画像"}: AIの応答が${stopReason === "max_tokens" ? "途中で途切れました" : "壊れていたため修復しました"}。抽出漏れがないか件数を確認してください (${newRows.length}件抽出)`,
+      });
     }
   }
 
@@ -805,18 +513,250 @@ export default function ReceiptScanPoc() {
   }
 
   // ---------- 行編集 ----------
+  // 案件を開いているときの受け付け判定と未保存マーク
+  function batchEditAllowed(kind) {
+    if (kind !== "receipt" || !batch) return true;
+    if (batchLocked) {
+      showToast("確定済みの案件は編集できません。編集するには「確定を取り消す」を押してください");
+      return false;
+    }
+    return true;
+  }
+  function markDirty(kind, id) {
+    if (kind !== "receipt" || !batch) return;
+    setDirty((p) => (p.has(id) ? p : new Set(p).add(id)));
+  }
   function updateRow(kind, id, key, value) {
+    if (!batchEditAllowed(kind)) return;
     const setter = kind === "receipt" ? setReceiptRows : setLedgerRows;
     setter((p) => p.map((r) => (r.id === id ? { ...r, [key]: value } : r)));
+    markDirty(kind, id);
   }
   function toggleReviewed(kind, id) {
+    if (!batchEditAllowed(kind)) return;
     const setter = kind === "receipt" ? setReceiptRows : setLedgerRows;
     setter((p) => p.map((r) => (r.id === id ? { ...r, reviewed: !r.reviewed } : r)));
+    markDirty(kind, id);
   }
   function removeRow(kind, id) {
+    if (!batchEditAllowed(kind)) return;
     const setter = kind === "receipt" ? setReceiptRows : setLedgerRows;
     setter((p) => p.filter((r) => r.id !== id));
+    if (kind === "receipt" && batch) {
+      deletedRef.current.add(id);
+      markDirty(kind, id);
+    }
   }
+
+  // ---------- 案件 (サーバー保存) ----------
+  const unsavedCount = dirty.size;
+
+  function rowFromItem(it) {
+    const current = it.current || {};
+    return {
+      ...current,
+      id: it.id,
+      confidence: it.confidence ?? current.confidence ?? 1,
+      reviewed: !!it.reviewed,
+      ai_raw: it.ai_raw,
+      _auto: it.auto,
+      _warnings: it.warnings || [],
+      original: snapshotReceiptOriginal(it.auto || {}),
+    };
+  }
+
+  function applyBatchDetail(d) {
+    setBatch({ ...d.batch, warnings: d.warnings || [], exports: d.exports || [], files: d.files || [] });
+    setReceiptRows((d.items || []).filter((it) => !it.deleted).map(rowFromItem));
+    setDirty(new Set());
+    deletedRef.current = new Set();
+    setBatchReasons([]);
+  }
+
+  function confirmDiscard() {
+    if (!batch || dirty.size === 0) return true;
+    return window.confirm(`未保存の変更が ${dirty.size} 件あります。破棄して続けますか？`);
+  }
+
+  async function refreshBatchList() {
+    try {
+      const d = await batchApi.list();
+      setBatchList(d.batches || []);
+    } catch (e) {
+      setBatchList([]);
+      showToast(`案件一覧を取得できません: ${e.message}`);
+    }
+  }
+
+  async function openBatch(id) {
+    if (!confirmDiscard()) return;
+    setBatchBusy(true);
+    try {
+      const d = await batchApi.get(id);
+      if (mode !== "receipt") await switchMode("receipt");
+      setItems([]);
+      applyBatchDetail(d);
+      setShowBatchList(false);
+    } catch (e) {
+      showToast(`案件を開けません: ${e.message}`);
+    }
+    setBatchBusy(false);
+  }
+
+  async function reloadBatch() {
+    if (!batch) return;
+    setBatchBusy(true);
+    try { applyBatchDetail(await batchApi.get(batch.id)); }
+    catch (e) { showToast(`再読み込みに失敗: ${e.message}`); }
+    setBatchBusy(false);
+  }
+
+  function closeBatch() {
+    if (!confirmDiscard()) return;
+    setBatch(null);
+    setReceiptRows([]);
+    setDirty(new Set());
+    deletedRef.current = new Set();
+    setBatchReasons([]);
+  }
+
+  // 画面で読み取った結果を新しい案件として保存
+  async function saveAsBatch() {
+    if (batch || receiptRows.length === 0) return;
+    if (!submissionIdRef.current) submissionIdRef.current = crypto.randomUUID();
+    setBatchBusy(true);
+    try {
+      const payload = {
+        submission_id: submissionIdRef.current,
+        title: batchTitle.trim() || null,
+        kind: "receipt",
+        items: receiptRows.map((r) => ({
+          ai_raw: r.ai_raw,
+          auto: r._auto || pickReceiptFields(r),
+          current: pickReceiptFields(r),
+          warnings: r._warnings || [],
+          confidence: typeof r.confidence === "number" ? r.confidence : null,
+          reviewed: !!r.reviewed,
+        })),
+        warnings: sessionWarningsRef.current,
+      };
+      const res = await batchApi.create(payload);
+      submissionIdRef.current = null;
+      sessionWarningsRef.current = [];
+      setBatchTitle("");
+      setItems([]);
+      applyBatchDetail(await batchApi.get(res.id));
+      showToast(res.duplicate ? "この結果はすでに保存済みです。保存済みの案件を開きました" : "案件として保存しました");
+    } catch (e) {
+      // submission_id は残すので、再送しても二重登録されない
+      showToast(`案件の保存に失敗: ${e.message}`);
+    }
+    setBatchBusy(false);
+  }
+
+  function handleConflict(e) {
+    if (e.code === "conflict" || e.code === "locked") {
+      showToast(e.message);
+      if (window.confirm(`${e.message}\n\n最新の内容を読み込み直しますか？ (この画面の未保存の変更は失われます)`)) {
+        reloadBatch();
+      }
+      return true;
+    }
+    return false;
+  }
+
+  // 途中保存。成功したら新しい rev を返す
+  async function saveBatch() {
+    if (!batch) return null;
+    if (dirty.size === 0) return batch.rev;
+    const byId = new Map(receiptRows.map((r) => [r.id, r]));
+    const changes = [];
+    for (const id of dirty) {
+      if (deletedRef.current.has(id)) { changes.push({ id, deleted: true }); continue; }
+      const r = byId.get(id);
+      if (r) changes.push({ id, current: pickReceiptFields(r), reviewed: !!r.reviewed });
+    }
+    setBatchBusy(true);
+    try {
+      const res = await batchApi.save(batch.id, batch.rev, changes);
+      setBatch((b) => ({ ...b, rev: res.rev, review_state: "in_review" }));
+      setDirty(new Set());
+      deletedRef.current = new Set();
+      showToast("途中保存しました");
+      setBatchBusy(false);
+      return res.rev;
+    } catch (e) {
+      setBatchBusy(false);
+      if (!handleConflict(e)) showToast(`保存に失敗: ${e.message}`);
+      return null;
+    }
+  }
+
+  async function confirmCurrentBatch() {
+    if (!batch) return;
+    const rev = await saveBatch();
+    if (rev === null) return;
+    setBatchBusy(true);
+    setBatchReasons([]);
+    try {
+      const res = await batchApi.confirm(batch.id, rev);
+      applyBatchDetail(await batchApi.get(batch.id));
+      showToast(`確定しました (確定版 v${res.version}・${res.rows}件)`);
+    } catch (e) {
+      if (e.code === "blocked") setBatchReasons(e.reasons || []);
+      else if (!handleConflict(e)) showToast(`確定に失敗: ${e.message}`);
+    }
+    setBatchBusy(false);
+  }
+
+  async function reopenCurrentBatch() {
+    if (!batch) return;
+    if (!window.confirm("確定を取り消して編集できる状態に戻しますか？ (出力済みの確定版CSVはそのまま残ります)")) return;
+    setBatchBusy(true);
+    try {
+      await batchApi.reopen(batch.id, batch.rev);
+      applyBatchDetail(await batchApi.get(batch.id));
+      showToast("確定を取り消しました");
+    } catch (e) {
+      if (!handleConflict(e)) showToast(`取り消しに失敗: ${e.message}`);
+    }
+    setBatchBusy(false);
+  }
+
+  async function resolveBatchWarning(wid) {
+    if (!batch) return;
+    try {
+      await batchApi.resolveWarning(batch.id, wid);
+      setBatch((b) => ({ ...b, warnings: b.warnings.map((w) => (w.id === wid ? { ...w, resolved: 1 } : w)) }));
+      setBatchReasons([]);
+    } catch (e) {
+      showToast(`警告の更新に失敗: ${e.message}`);
+    }
+  }
+
+  async function downloadBatchExport(exportId) {
+    try {
+      const { blob, filename } = await batchApi.exportCsv(batch.id, exportId);
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    } catch (e) {
+      showToast(`CSVの取得に失敗: ${e.message}`);
+    }
+  }
+
+  // 未保存の変更があるときは離脱前に確認
+  useEffect(() => {
+    if (!batch || dirty.size === 0) return;
+    const h = (e) => { e.preventDefault(); e.returnValue = ""; };
+    window.addEventListener("beforeunload", h);
+    return () => window.removeEventListener("beforeunload", h);
+  }, [batch, dirty]);
 
   // ---------- 教訓 ----------
   function getDiffs(row) {
@@ -842,15 +782,7 @@ export default function ReceiptScanPoc() {
     }
     setSavingLesson(true);
     try {
-      const prompt = `帳票読み取りAIが誤読し、人間が訂正しました。この事例から、今後の読み取りで同じ誤りを防ぐための「一般化された教訓」を1〜2文の日本語で作成してください。
-
-【AIの読み取り → 人間の訂正】
-${diffs.map((d) => `- ${d.label}: 「${d.oldValue}」→「${d.newValue}」`).join("\n") || "(表の修正なし)"}
-
-【訂正した人のコメント】
-${correctionReason.trim() || "(コメントなし)"}
-
-要件: 特定の帳票固有の情報ではなく、他の帳票にも適用できる一般ルールとして簡潔に書く。教訓の本文のみを出力。`;
+      const prompt = buildLessonPrompt(diffs, correctionReason.trim());
       const text = await callClaude([{ type: "text", text: prompt }], 300);
       await persistLessons([...lessons, { id: Date.now(), text: text.trim(), createdAt: new Date().toISOString() }]);
       showToast("教訓を保存しました。次回の読み取りから反映されます");
@@ -1000,6 +932,34 @@ ${correctionReason.trim() || "(コメントなし)"}
           </section>
         )}
 
+        {/* 案件 (サーバー保存) */}
+        {mode === "receipt" && (
+          <BatchPanel
+            batch={batch}
+            locked={batchLocked}
+            busy={batchBusy}
+            unsavedCount={unsavedCount}
+            rowCount={receiptRows.length}
+            reviewCount={lowConfReceipts}
+            reasons={batchReasons}
+            title={batchTitle}
+            setTitle={setBatchTitle}
+            list={batchList}
+            showList={showBatchList}
+            onToggleList={() => { const next = !showBatchList; setShowBatchList(next); if (next) refreshBatchList(); }}
+            onRefreshList={refreshBatchList}
+            onOpen={openBatch}
+            onSaveAs={saveAsBatch}
+            onSave={saveBatch}
+            onConfirm={confirmCurrentBatch}
+            onReopen={reopenCurrentBatch}
+            onReload={() => { if (confirmDiscard()) reloadBatch(); }}
+            onClose={closeBatch}
+            onResolveWarning={resolveBatchWarning}
+            onDownloadExport={downloadBatchExport}
+          />
+        )}
+
         {/* STEP 1 */}
         <section className="mb-6">
           <div className="mb-2 flex items-baseline gap-2">
@@ -1008,8 +968,8 @@ ${correctionReason.trim() || "(コメントなし)"}
           </div>
           <input ref={fileRef} type="file" accept={acceptTypes} multiple className="hidden"
             onChange={(e) => { handleFiles(e.target.files); e.target.value = ""; }} />
-          <button onClick={() => fileRef.current?.click()}
-            className="w-full rounded-lg border-2 border-dashed border-slate-300 bg-white py-8 text-sm text-slate-600 transition hover:border-slate-500 hover:text-slate-900">
+          <button onClick={() => fileRef.current?.click()} disabled={!!batch && mode === "receipt"}
+            className="w-full rounded-lg border-2 border-dashed disabled:cursor-not-allowed disabled:opacity-40 border-slate-300 bg-white py-8 text-sm text-slate-600 transition hover:border-slate-500 hover:text-slate-900">
             <span className="block text-2xl">{mode === "excel" ? "📊" : "📷"}</span>
             <span className="mt-1 block font-medium">
               {mode === "excel" ? "タップしてファイルを選択 (.xlsx / .csv)" : "タップして撮影 / 画像・PDFを選択"}
@@ -1524,4 +1484,170 @@ function StatCard({ label, value, accent, small }) {
       <p className={`font-mono ${small ? "truncate text-xs" : "text-xl font-bold"} ${accent === "red" ? "text-red-600" : accent === "green" ? "text-emerald-600" : ""}`}>{value}</p>
     </div>
   );
+}
+
+// ---------- 案件 (サーバー保存) パネル ----------
+const REVIEW_STATE_LABELS = { pending: "未確認", in_review: "確認中", confirmed: "確定済み" };
+
+function BatchPanel(props) {
+  const {
+    batch, locked, busy, unsavedCount, rowCount, reviewCount, reasons, title, setTitle,
+    list, showList, onToggleList, onRefreshList, onOpen, onSaveAs, onSave, onConfirm, onReopen, onReload, onClose,
+    onResolveWarning, onDownloadExport,
+  } = props;
+  const openWarnings = (batch?.warnings || []).filter((w) => !w.resolved);
+  const confirmedExports = (batch?.exports || []).filter((x) => x.kind === "confirmed");
+  const btn = "rounded border px-3 py-1.5 text-xs font-medium transition disabled:opacity-30";
+
+  return (
+    <section className="mb-6 rounded-lg border border-sky-200 bg-sky-50/60 p-4">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <h2 className="text-sm font-bold text-sky-900">
+          案件 <span className="ml-1 text-[11px] font-normal text-sky-700">(サーバーに保存して、途中保存・再表示・確定ができます)</span>
+        </h2>
+        <button onClick={onToggleList} disabled={busy} className={`${btn} border-sky-300 bg-white text-sky-800 hover:border-sky-600`}>
+          {showList ? "一覧を閉じる" : "案件一覧"}
+        </button>
+      </div>
+
+      {showList && (
+        <div className="mt-3 rounded border border-sky-200 bg-white p-2">
+          <div className="mb-1 flex items-center justify-between text-[11px] text-slate-500">
+            <span>最近更新された案件 (最大100件)</span>
+            <button onClick={onRefreshList} className="underline hover:text-slate-800">更新</button>
+          </div>
+          {list === null ? (
+            <p className="p-2 text-xs text-slate-400">読み込み中…</p>
+          ) : list.length === 0 ? (
+            <p className="p-2 text-xs text-slate-400">保存された案件はまだありません</p>
+          ) : (
+            <ul className="divide-y divide-slate-100">
+              {list.map((b) => (
+                <li key={b.id}>
+                  <button onClick={() => onOpen(b.id)} disabled={busy}
+                    className={`flex w-full flex-wrap items-center gap-2 px-2 py-1.5 text-left text-xs hover:bg-sky-50 ${batch?.id === b.id ? "bg-sky-100" : ""}`}>
+                    <span className="font-medium">{b.title || "(無題)"}</span>
+                    {b.client_name && <span className="text-slate-500">{b.client_name}</span>}
+                    <StateBadge state={b.review_state} />
+                    <span className="text-slate-500">{b.item_count}件</span>
+                    {b.review_count > 0 && <span className="text-amber-600">⚠ 要確認 {b.review_count}</span>}
+                    {b.warning_count > 0 && <span className="text-red-600">警告 {b.warning_count}</span>}
+                    <span className="ml-auto font-mono text-[10px] text-slate-400">{fmtTime(b.updated_at)}</span>
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      )}
+
+      {!batch && (
+        <div className="mt-3 flex flex-col gap-2 sm:flex-row sm:items-center">
+          <input value={title} onChange={(e) => setTitle(e.target.value)} placeholder="案件名 (任意。例: ○○商店 10月分)"
+            className="flex-1 rounded border border-slate-300 bg-white px-2 py-1.5 text-xs focus:border-sky-600 focus:outline-none" />
+          <button onClick={onSaveAs} disabled={busy || rowCount === 0}
+            className={`${btn} border-sky-700 bg-sky-700 text-white hover:bg-sky-800`}>
+            {busy ? "保存中…" : `この読み取り結果を案件として保存 (${rowCount}件)`}
+          </button>
+        </div>
+      )}
+
+      {batch && (
+        <div className="mt-3 space-y-3">
+          <div className="flex flex-wrap items-center gap-2 text-xs">
+            <span className="font-bold">{batch.title || "(無題)"}</span>
+            <StateBadge state={batch.review_state} />
+            <span className="text-slate-500">{rowCount}件</span>
+            {reviewCount > 0 && <span className="text-amber-600">⚠ 要確認 {reviewCount}</span>}
+            {unsavedCount > 0 && <span className="rounded bg-amber-100 px-1.5 py-0.5 text-amber-800">未保存の変更 {unsavedCount}</span>}
+            <span className="font-mono text-[10px] text-slate-400">版 {batch.rev}</span>
+          </div>
+
+          {locked && (
+            <p className="rounded bg-emerald-50 px-2 py-1.5 text-[11px] text-emerald-800">
+              確定済みのため編集できません。修正が必要な場合は「確定を取り消す」を押してください (確定版CSVは上書きされず、次の確定は新しい版になります)。
+            </p>
+          )}
+
+          <div className="flex flex-wrap gap-2">
+            {!locked && (
+              <>
+                <button onClick={onSave} disabled={busy || unsavedCount === 0} className={`${btn} border-slate-700 bg-white hover:bg-slate-900 hover:text-white`}>
+                  途中保存
+                </button>
+                <button onClick={onConfirm} disabled={busy} className={`${btn} border-emerald-700 bg-emerald-700 text-white hover:bg-emerald-800`}>
+                  {unsavedCount > 0 ? "保存して確定" : "確定"}
+                </button>
+              </>
+            )}
+            {locked && (
+              <button onClick={onReopen} disabled={busy} className={`${btn} border-amber-600 bg-white text-amber-700 hover:bg-amber-50`}>
+                確定を取り消す
+              </button>
+            )}
+            <button onClick={onReload} disabled={busy} className={`${btn} border-slate-300 bg-white text-slate-600 hover:border-slate-600`}>
+              再読み込み
+            </button>
+            <button onClick={onClose} disabled={busy} className={`${btn} border-slate-300 bg-white text-slate-600 hover:border-slate-600`}>
+              案件を閉じる
+            </button>
+          </div>
+
+          {reasons.length > 0 && (
+            <div className="rounded border border-red-200 bg-red-50 p-2 text-xs text-red-800">
+              <p className="font-bold">確定できません</p>
+              <ul className="mt-1 list-disc pl-5">
+                {reasons.map((r, i) => <li key={i}>{r}</li>)}
+              </ul>
+            </div>
+          )}
+
+          {openWarnings.length > 0 && (
+            <div className="rounded border border-amber-200 bg-amber-50 p-2 text-xs">
+              <p className="font-bold text-amber-900">未解決の警告 ({openWarnings.length})</p>
+              <ul className="mt-1 space-y-1">
+                {openWarnings.map((w) => (
+                  <li key={w.id} className="flex items-start gap-2">
+                    <span className="flex-1 text-amber-900">{w.message}</span>
+                    {!locked && (
+                      <button onClick={() => onResolveWarning(w.id)} className="shrink-0 rounded border border-amber-400 bg-white px-2 py-0.5 text-[11px] text-amber-800 hover:bg-amber-100">
+                        確認済みにする
+                      </button>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+
+          {confirmedExports.length > 0 && (
+            <div className="text-xs">
+              <p className="mb-1 font-bold text-slate-700">確定版CSV</p>
+              <div className="flex flex-wrap gap-2">
+                {confirmedExports.map((x) => (
+                  <button key={x.id} onClick={() => onDownloadExport(x.id)}
+                    className="rounded border border-emerald-600 bg-white px-2 py-1 text-emerald-700 hover:bg-emerald-50">
+                    v{x.version} をダウンロード <span className="text-[10px] text-slate-400">{fmtTime(x.created_at)}</span>
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function StateBadge({ state }) {
+  const cls = state === "confirmed" ? "bg-emerald-100 text-emerald-800" : state === "in_review" ? "bg-sky-100 text-sky-800" : "bg-slate-100 text-slate-600";
+  return <span className={`rounded px-1.5 py-0.5 text-[10px] ${cls}`}>{REVIEW_STATE_LABELS[state] || state}</span>;
+}
+
+function fmtTime(iso) {
+  if (!iso) return "";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "";
+  const p = (n) => String(n).padStart(2, "0");
+  return `${d.getMonth() + 1}/${d.getDate()} ${p(d.getHours())}:${p(d.getMinutes())}`;
 }
